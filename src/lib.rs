@@ -1,0 +1,451 @@
+//! Experimental ui_uring-driven asynchronous runtime.
+
+#![deny(missing_docs)]
+
+use std::{
+    cell::RefCell,
+    collections::{HashMap, VecDeque},
+    future::Future,
+    net::{SocketAddr, TcpListener, TcpStream},
+    os::unix::prelude::{AsRawFd, FromRawFd},
+    pin::Pin,
+    slice::SliceIndex,
+    sync::{atomic::AtomicBool, Arc},
+    task::{Context, Poll, Wake},
+};
+
+use buffers::BufferRawParts;
+use io_uring::{opcode, types, IoUring};
+use once_cell::unsync::Lazy;
+use parking_lot::Mutex;
+use slab::Slab;
+
+mod accept;
+pub mod buffers;
+mod read_write;
+
+pub use accept::{AcceptAddress, AcceptFuture, ListenerExt};
+pub use buffers::{Buffer, BufferMut};
+pub use read_write::{IoFuture, StreamExt};
+
+thread_local! {
+    static SHARED: Lazy<RefCell<Option<Arc<Shared>>>> = Lazy::new(|| RefCell::new(None));
+}
+
+fn with_shared<F, R>(f: F) -> R
+where
+    F: FnOnce(&Arc<Shared>) -> R,
+{
+    SHARED.with(|maybe_shared| f(maybe_shared.borrow().as_ref().expect("Executor is not set")))
+}
+
+/// A detached handle that can be used to create futures.
+pub struct Handle {
+    inner: Arc<Shared>,
+}
+
+impl Handle {
+    /// Creates an execution handle.
+    ///
+    /// # Panics
+    ///
+    /// Panics when executed out of the runtime's context.
+    pub fn out_of_thin_air() -> Self {
+        let shared = with_shared(Arc::clone);
+        Self { inner: shared }
+    }
+}
+
+/// An io_uring-driven asynchronous runtime.
+pub struct Runtime {
+    ring: IoUring,
+
+    shared: Arc<Shared>,
+}
+
+#[derive(Default)]
+struct Shared {
+    /// Pending to submit events.
+    to_submit: Mutex<VecDeque<io_uring::squeue::Entry>>,
+
+    pending_events: Mutex<Slab<Event>>,
+    ready_events: Mutex<HashMap<usize, EventResult>>,
+}
+
+enum EventResult {
+    IoEvent(std::io::Result<usize>),
+}
+
+struct Event {
+    data: AssociatedData,
+    waker: Option<std::task::Waker>,
+}
+
+enum AssociatedData {
+    Buffer(BufferRawParts),
+    Address(AcceptAddress),
+}
+
+impl Runtime {
+    /// Creates a new io_uring runtime, using the provided [IoUring] as a
+    /// backend.
+    pub fn new(ring: IoUring) -> Self {
+        Self {
+            ring,
+            shared: Arc::new(Shared::default()),
+        }
+    }
+
+    /// Creates a handle to spawn the futures outside of the main execution
+    /// context.
+    pub fn handle(&self) -> Handle {
+        Handle {
+            inner: self.shared.clone(),
+        }
+    }
+
+    /// Sets up the execution context and runs the provided future to the
+    /// completion.
+    pub fn block_on<F>(&mut self, mut future: F) -> F::Output
+    where
+        F: Future,
+    {
+        let original_waker = Arc::new(UringWaker(AtomicBool::new(true)));
+        let waker = original_waker.clone().into();
+        let mut context = Context::from_waker(&waker);
+
+        SHARED.with(|shared| {
+            *shared.borrow_mut() = Some(self.shared.clone());
+        });
+
+        // Pin down the future. Since we shadow the original `future`, it can't
+        // be accessed directly anymore.
+        let mut future = unsafe { Pin::new_unchecked(&mut future) };
+        let ready = loop {
+            if original_waker
+                .0
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                match future.as_mut().poll(&mut context) {
+                    Poll::Ready(ready) => break ready,
+                    Poll::Pending => { /* Continue the cycle */ }
+                };
+            }
+
+            // The future might have registered some events. Add them to the
+            // queue!
+            let submitted_everything = self.submit_pending();
+
+            let awaken = original_waker.0.load(std::sync::atomic::Ordering::Relaxed);
+            let consumed_entires = self
+                .ring
+                .submit_and_wait(if awaken { 0 } else { 1 })
+                .expect("Unexpected uring I/O error");
+            for completed in self.ring.completion() {
+                let result = completed.result();
+                let result =
+                    usize::try_from(result).map_err(|_| std::io::Error::from_raw_os_error(-result));
+                let token = completed.user_data() as usize;
+                self.shared
+                    .ready_events
+                    .lock()
+                    .insert(token, EventResult::IoEvent(result));
+                if let Some(waker) = self.shared.pending_events.lock()[token].waker.take() {
+                    waker.wake()
+                }
+            }
+            if consumed_entires != 0 && !submitted_everything {
+                // If we have something to submit (!submitted_everything) and
+                // the "submit_and_wait" has consumed some entries
+                // (consumed_entires != 0), we've got a chance to submit pending
+                // entries.
+                self.submit_pending();
+            }
+        };
+
+        SHARED.with(|shared| {
+            *shared.borrow_mut() = None;
+        });
+
+        ready
+    }
+
+    fn submit_pending(&mut self) -> bool {
+        let mut to_submit = self.shared.to_submit.lock();
+        while let Some(entry) = to_submit.pop_front() {
+            if unsafe { self.ring.submission().push(&entry) }.is_err() {
+                to_submit.push_front(entry);
+                break;
+            }
+        }
+        to_submit.is_empty()
+    }
+}
+
+impl Shared {
+    fn read_write_ready(
+        &self,
+        cx: &mut Context<'_>,
+        token: usize,
+    ) -> Option<(BufferRawParts, std::io::Result<usize>)> {
+        if let Some(event) = self.ready_events.lock().remove(&token) {
+            let Event { data, .. } = self
+                .pending_events
+                .lock()
+                .try_remove(token)
+                .expect("Where did it go?");
+            let buffer_parts = match data {
+                AssociatedData::Buffer(buffer_parts) => buffer_parts,
+                _ => unreachable!(),
+            };
+            match event {
+                EventResult::IoEvent(result) => Some((buffer_parts, result)),
+            }
+        } else {
+            // Not ready yet.
+            self.pending_events.lock()[token].waker = Some(cx.waker().clone());
+            None
+        }
+    }
+
+    fn accept_ready(
+        &self,
+        cx: &mut Context<'_>,
+        token: usize,
+    ) -> Option<(AcceptAddress, std::io::Result<(TcpStream, SocketAddr)>)> {
+        if let Some(event) = self.ready_events.lock().remove(&token) {
+            let Event { data, .. } = self
+                .pending_events
+                .lock()
+                .try_remove(token)
+                .expect("Where did it go?");
+            let address = match data {
+                AssociatedData::Address(address) => address,
+                _ => unreachable!(),
+            };
+            let socket_address = unsafe { address.assume_init() };
+            match event {
+                EventResult::IoEvent(result) => Some((
+                    address,
+                    result.map(|fd| {
+                        let stream = unsafe { TcpStream::from_raw_fd(fd as _) };
+                        (stream, socket_address)
+                    }),
+                )),
+            }
+        } else {
+            // Not ready yet.
+            self.pending_events.lock()[token].waker = Some(cx.waker().clone());
+            None
+        }
+    }
+}
+
+impl Shared {
+    /// Creates a future that will write some bytes to the [TcpStream] from the
+    /// provided buffer.
+    ///
+    /// # Notes
+    ///
+    /// 1. No more than first [u32::MAX] bytes of the buffer (after `range`
+    ///    applied) will be sent.
+    /// 2. If applying the `range` results in an empty slice, the returned
+    ///    future will be immediately ready.
+    /// 3. See the `Panics` sections.
+    ///
+    /// # Panics
+    ///
+    /// If the `range` is out of bounds of the provided buffer, the function
+    /// will panic.
+    pub fn socket_write<B, R>(&self, socket: &TcpStream, buffer: B, range: R) -> IoFuture<B>
+    where
+        B: Buffer,
+        R: SliceIndex<[u8], Output = [u8]>,
+    {
+        let slice = match buffer.slice().get(range) {
+            Some(slice) => slice,
+            None => panic!("Range out of bounds"),
+        };
+        if slice.is_empty() {
+            return IoFuture::noop(buffer);
+        }
+        let mut pending_events = self.pending_events.lock();
+        let vacant = pending_events.vacant_entry();
+        let token = vacant.key();
+        let event = opcode::Write::new(
+            types::Fd(socket.as_raw_fd()),
+            slice.as_ptr(),
+            u32::try_from(slice.len()).unwrap_or(u32::MAX),
+        )
+        .build()
+        .user_data(token as u64);
+
+        self.to_submit.lock().push_back(event);
+
+        let buffer_parts = buffer.split_into_raw_parts();
+        let event = Event {
+            data: AssociatedData::Buffer(buffer_parts),
+            waker: None,
+        };
+
+        vacant.insert(event);
+        IoFuture::with_token(token)
+    }
+
+    /// Creates a future that will read some bytes from the [TcpStream] into the
+    /// provided buffer.
+    ///
+    /// # Notes
+    ///
+    /// 1. No more than first [u32::MAX] bytes of the buffer (after `range`
+    ///    applied) will be filled.
+    /// 2. If applying the `range` results in an empty slice, the returned
+    ///    future will be immediately ready.
+    /// 3. See the `Panics` sections.
+    ///
+    /// # Panics
+    ///
+    /// If the `range` is out of bounds of the provided buffer, the function
+    /// will panic.
+    pub fn socket_read<B, R>(&self, socket: &TcpStream, mut buffer: B, range: R) -> IoFuture<B>
+    where
+        B: BufferMut,
+        R: SliceIndex<[u8], Output = [u8]>,
+    {
+        let slice = match buffer.slice_mut().get_mut(range) {
+            Some(slice) => slice,
+            None => panic!("Range out of bounds"),
+        };
+        if slice.is_empty() {
+            return IoFuture::noop(buffer);
+        }
+        let mut pending_events = self.pending_events.lock();
+        let vacant = pending_events.vacant_entry();
+        let token = vacant.key();
+        let event = opcode::Read::new(
+            types::Fd(socket.as_raw_fd()),
+            slice.as_mut_ptr(),
+            u32::try_from(slice.len()).unwrap_or(u32::MAX),
+        )
+        .build()
+        .user_data(token as u64);
+
+        self.to_submit.lock().push_back(event);
+
+        let buffer_parts = buffer.split_into_raw_parts();
+        let event = Event {
+            data: AssociatedData::Buffer(buffer_parts),
+            waker: None,
+        };
+
+        vacant.insert(event);
+        IoFuture::with_token(token)
+    }
+
+    /// Creates a future that will resolve when a new connection arrives.
+    pub fn accept_socket(&self, socket: &TcpListener, mut address: AcceptAddress) -> AcceptFuture {
+        let mut pending_events = self.pending_events.lock();
+        let vacant = pending_events.vacant_entry();
+        let token = vacant.key();
+        address.reset();
+        let event = opcode::Accept::new(
+            types::Fd(socket.as_raw_fd()),
+            address.socket_address.as_ptr(),
+            address.address_length.as_ptr(),
+        )
+        .build()
+        .user_data(token as u64);
+
+        self.to_submit.lock().push_back(event);
+
+        let event = Event {
+            data: AssociatedData::Address(address),
+            waker: None,
+        };
+
+        vacant.insert(event);
+        AcceptFuture { token: Some(token) }
+    }
+}
+
+impl Handle {
+    /// Creates a future that will write some bytes to the [TcpStream] from the
+    /// provided buffer.
+    ///
+    /// # Notes
+    ///
+    /// 1. No more than first [u32::MAX] bytes of the buffer (after `range`
+    ///    applied) will be sent.
+    /// 2. If applying the `range` results in an empty slice, the returned
+    ///    future will be immediately ready.
+    /// 3. See the `Panics` sections.
+    ///
+    /// # Panics
+    ///
+    /// If the `range` is out of bounds of the provided buffer, the function
+    /// will panic.
+    pub fn socket_write<B, R>(&self, socket: &TcpStream, buffer: B, range: R) -> IoFuture<B>
+    where
+        B: Buffer,
+        R: SliceIndex<[u8], Output = [u8]>,
+    {
+        self.inner.socket_write(socket, buffer, range)
+    }
+
+    /// Creates a future that will read some bytes from the [TcpStream] into the
+    /// provided buffer.
+    ///
+    /// # Notes
+    ///
+    /// 1. No more than first [u32::MAX] bytes of the buffer (after `range`
+    ///    applied) will be filled.
+    /// 2. If applying the `range` results in an empty slice, the returned
+    ///    future will be immediately ready.
+    /// 3. See the `Panics` sections.
+    ///
+    /// # Panics
+    ///
+    /// If the `range` is out of bounds of the provided buffer, the function
+    /// will panic.
+    pub fn socket_read<B, R>(&self, socket: &TcpStream, buffer: B, range: R) -> IoFuture<B>
+    where
+        B: BufferMut,
+        R: SliceIndex<[u8], Output = [u8]>,
+    {
+        self.inner.socket_read(socket, buffer, range)
+    }
+
+    /// Creates a future that will resolve when a new connection arrives.
+    pub fn accept_socket(&self, socket: &TcpListener, address: AcceptAddress) -> AcceptFuture {
+        self.inner.accept_socket(socket, address)
+    }
+}
+
+struct UringWaker(AtomicBool);
+
+impl Wake for UringWaker {
+    fn wake(self: Arc<Self>) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        if self.shared.pending_events.lock().is_empty() {
+            return;
+        }
+        // Ensure that there are no pending requests in the queues which
+        // reference the buffers we are going to drop when `self.events` is
+        // dropped.
+        let pending_events = self.ring.submission().len();
+        if let Err(_e) = self.ring.submit_and_wait(pending_events) {
+            // TODO: log the error
+            return;
+        };
+        self.ring.completion().for_each(drop);
+    }
+}

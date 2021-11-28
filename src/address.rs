@@ -201,3 +201,9 @@ impl From<&'_ SocketAddress<Initialized>> for SocketAddr {
         address.as_socket_addr()
     }
 }
+
+impl From<SocketAddr> for SocketAddress<Initialized> {
+    fn from(address: SocketAddr) -> Self {
+        SocketAddress::new().fill(address)
+    }
+}

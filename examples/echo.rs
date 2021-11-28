@@ -2,7 +2,7 @@ use std::net::{Ipv6Addr, TcpListener, TcpStream};
 
 use anyhow::Context;
 use io_uring::IoUring;
-use uring_executor::{AcceptAddress, ListenerExt, Runtime, StreamExt};
+use uring_executor::{ListenerExt, Runtime, SocketAddress, StreamExt};
 
 fn main() -> anyhow::Result<()> {
     let ring = IoUring::new(100).context("IoUring::new")?;
@@ -11,7 +11,7 @@ fn main() -> anyhow::Result<()> {
     let listener =
         TcpListener::bind((Ipv6Addr::UNSPECIFIED, 1024)).context("Listen to port [::]:1024")?;
 
-    if let Err(e) = runtime.block_on(run(&listener, vec![0u8; 1024], AcceptAddress::new())) {
+    if let Err(e) = runtime.block_on(run(&listener, vec![0u8; 1024], SocketAddress::new())) {
         eprintln!("Accepting loop terminated with error: {:#}", e)
     }
 
@@ -23,15 +23,16 @@ enum Never {}
 async fn run(
     listener: &TcpListener,
     mut buffer: Vec<u8>,
-    mut address_buffer: AcceptAddress,
+    mut address_buffer: SocketAddress<uring_executor::address::Uninitialized>,
 ) -> anyhow::Result<Never> {
     loop {
         println!("Waiting for connection");
         let (result, temp_address_buffer) = listener.async_accept(address_buffer).await;
-        address_buffer = temp_address_buffer;
+        let peer_address = temp_address_buffer.as_socket_addr();
+        address_buffer = temp_address_buffer.into_uninit();
 
-        let (stream, address) = result.context("Accept")?;
-        println!("Accepted connection from {}", address);
+        let stream = result.context("Accept")?;
+        println!("Accepted connection from {}", peer_address);
 
         let (result, temp_buffer) = copy_all(stream, buffer).await;
         if let Err(e) = result {

@@ -6,7 +6,7 @@ use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
     future::Future,
-    net::{SocketAddr, TcpListener, TcpStream},
+    net::{TcpListener, TcpStream},
     os::unix::prelude::{AsRawFd, FromRawFd},
     pin::Pin,
     slice::SliceIndex,
@@ -14,6 +14,7 @@ use std::{
     task::{Context, Poll, Wake},
 };
 
+use address::Uninitialized;
 use buffers::BufferRawParts;
 use io_uring::{opcode, types, IoUring};
 use once_cell::unsync::Lazy;
@@ -21,10 +22,12 @@ use parking_lot::Mutex;
 use slab::Slab;
 
 mod accept;
+pub mod address;
 pub mod buffers;
 mod read_write;
 
-pub use accept::{AcceptAddress, AcceptFuture, ListenerExt};
+pub use accept::{AcceptFuture, ListenerExt};
+pub use address::SocketAddress;
 pub use buffers::{Buffer, BufferMut};
 pub use read_write::{IoFuture, StreamExt};
 
@@ -68,7 +71,7 @@ struct Shared {
     /// Pending to submit events.
     to_submit: Mutex<VecDeque<io_uring::squeue::Entry>>,
 
-    pending_events: Mutex<Slab<Event>>,
+    pending_events: Mutex<Slab<PendingEvent>>,
     ready_events: Mutex<HashMap<usize, EventResult>>,
 }
 
@@ -76,14 +79,14 @@ enum EventResult {
     IoEvent(std::io::Result<usize>),
 }
 
-struct Event {
+struct PendingEvent {
     data: AssociatedData,
     waker: Option<std::task::Waker>,
 }
 
 enum AssociatedData {
     Buffer(BufferRawParts),
-    Address(AcceptAddress),
+    Address(SocketAddress<Uninitialized>),
 }
 
 impl Runtime {
@@ -183,23 +186,19 @@ impl Runtime {
 }
 
 impl Shared {
-    fn read_write_ready(
+    fn take_token(
         &self,
         cx: &mut Context<'_>,
         token: usize,
-    ) -> Option<(BufferRawParts, std::io::Result<usize>)> {
+    ) -> Option<(AssociatedData, std::io::Result<usize>)> {
         if let Some(event) = self.ready_events.lock().remove(&token) {
-            let Event { data, .. } = self
+            let PendingEvent { data, .. } = self
                 .pending_events
                 .lock()
                 .try_remove(token)
                 .expect("Where did it go?");
-            let buffer_parts = match data {
-                AssociatedData::Buffer(buffer_parts) => buffer_parts,
-                _ => unreachable!(),
-            };
             match event {
-                EventResult::IoEvent(result) => Some((buffer_parts, result)),
+                EventResult::IoEvent(result) => Some((data, result)),
             }
         } else {
             // Not ready yet.
@@ -208,35 +207,46 @@ impl Shared {
         }
     }
 
-    fn accept_ready(
+    fn read_write_ready(
         &self,
         cx: &mut Context<'_>,
         token: usize,
-    ) -> Option<(AcceptAddress, std::io::Result<(TcpStream, SocketAddr)>)> {
-        if let Some(event) = self.ready_events.lock().remove(&token) {
-            let Event { data, .. } = self
-                .pending_events
-                .lock()
-                .try_remove(token)
-                .expect("Where did it go?");
-            let address = match data {
-                AssociatedData::Address(address) => address,
-                _ => unreachable!(),
-            };
-            let socket_address = unsafe { address.assume_init() };
-            match event {
-                EventResult::IoEvent(result) => Some((
-                    address,
-                    result.map(|fd| {
-                        let stream = unsafe { TcpStream::from_raw_fd(fd as _) };
-                        (stream, socket_address)
-                    }),
-                )),
+    ) -> Option<(BufferRawParts, std::io::Result<usize>)> {
+        match self.take_token(cx, token) {
+            Some((data, result)) => {
+                let buffer_parts = match data {
+                    AssociatedData::Buffer(buffer_parts) => buffer_parts,
+                    _ => unreachable!(),
+                };
+
+                Some((buffer_parts, result))
             }
-        } else {
-            // Not ready yet.
-            self.pending_events.lock()[token].waker = Some(cx.waker().clone());
-            None
+            None => None,
+        }
+    }
+
+    fn connection_ready(
+        &self,
+        cx: &mut Context<'_>,
+        token: usize,
+    ) -> Option<(
+        std::io::Result<TcpStream>,
+        SocketAddress<address::Initialized>,
+    )> {
+        match self.take_token(cx, token) {
+            Some((data, result)) => {
+                let address = match data {
+                    AssociatedData::Address(address) => address,
+                    _ => unreachable!(),
+                };
+                // Safety: the address is initialized by the io-uring.
+                let address = unsafe { address.assume_init() };
+                Some((
+                    result.map(|fd| unsafe { TcpStream::from_raw_fd(fd as _) }),
+                    address,
+                ))
+            }
+            None => None,
         }
     }
 }
@@ -269,26 +279,21 @@ impl Shared {
         if slice.is_empty() {
             return IoFuture::noop(buffer);
         }
-        let mut pending_events = self.pending_events.lock();
-        let vacant = pending_events.vacant_entry();
-        let token = vacant.key();
-        let event = opcode::Write::new(
+
+        let entry = opcode::Write::new(
             types::Fd(socket.as_raw_fd()),
             slice.as_ptr(),
             u32::try_from(slice.len()).unwrap_or(u32::MAX),
         )
-        .build()
-        .user_data(token as u64);
-
-        self.to_submit.lock().push_back(event);
+        .build();
 
         let buffer_parts = buffer.split_into_raw_parts();
-        let event = Event {
+        let event = PendingEvent {
             data: AssociatedData::Buffer(buffer_parts),
             waker: None,
         };
 
-        vacant.insert(event);
+        let token = self.add_event(entry, event);
         IoFuture::with_token(token)
     }
 
@@ -319,52 +324,58 @@ impl Shared {
         if slice.is_empty() {
             return IoFuture::noop(buffer);
         }
-        let mut pending_events = self.pending_events.lock();
-        let vacant = pending_events.vacant_entry();
-        let token = vacant.key();
-        let event = opcode::Read::new(
+
+        let entry = opcode::Read::new(
             types::Fd(socket.as_raw_fd()),
             slice.as_mut_ptr(),
             u32::try_from(slice.len()).unwrap_or(u32::MAX),
         )
-        .build()
-        .user_data(token as u64);
-
-        self.to_submit.lock().push_back(event);
+        .build();
 
         let buffer_parts = buffer.split_into_raw_parts();
-        let event = Event {
+        let event = PendingEvent {
             data: AssociatedData::Buffer(buffer_parts),
             waker: None,
         };
 
-        vacant.insert(event);
+        let token = self.add_event(entry, event);
+
         IoFuture::with_token(token)
     }
 
     /// Creates a future that will resolve when a new connection arrives.
-    pub fn accept_socket(&self, socket: &TcpListener, mut address: AcceptAddress) -> AcceptFuture {
-        let mut pending_events = self.pending_events.lock();
-        let vacant = pending_events.vacant_entry();
-        let token = vacant.key();
-        address.reset();
-        let event = opcode::Accept::new(
+    pub fn accept_socket<Marker>(
+        &self,
+        socket: &TcpListener,
+        address: SocketAddress<Marker>,
+    ) -> AcceptFuture {
+        let address = address.reset();
+
+        let entry = opcode::Accept::new(
             types::Fd(socket.as_raw_fd()),
             address.socket_address.as_ptr(),
             address.address_length.as_ptr(),
         )
-        .build()
-        .user_data(token as u64);
+        .build();
 
-        self.to_submit.lock().push_back(event);
-
-        let event = Event {
-            data: AssociatedData::Address(address),
+        let event = PendingEvent {
+            data: AssociatedData::Address(address.into_uninit()),
             waker: None,
         };
 
-        vacant.insert(event);
+        let token = self.add_event(entry, event);
+
         AcceptFuture { token: Some(token) }
+    }
+
+    fn add_event(&self, entry: io_uring::squeue::Entry, event: PendingEvent) -> usize {
+        let mut pending_events = self.pending_events.lock();
+        let vacant = pending_events.vacant_entry();
+        let token = vacant.key();
+        let entry = entry.user_data(token as u64);
+        self.to_submit.lock().push_back(entry);
+        vacant.insert(event);
+        token
     }
 }
 
@@ -416,7 +427,11 @@ impl Handle {
     }
 
     /// Creates a future that will resolve when a new connection arrives.
-    pub fn accept_socket(&self, socket: &TcpListener, address: AcceptAddress) -> AcceptFuture {
+    pub fn accept_socket<Marker>(
+        &self,
+        socket: &TcpListener,
+        address: SocketAddress<Marker>,
+    ) -> AcceptFuture {
         self.inner.accept_socket(socket, address)
     }
 }

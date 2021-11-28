@@ -27,11 +27,16 @@ async fn run(
 ) -> anyhow::Result<Never> {
     loop {
         println!("Waiting for connection");
-        let (result, temp_address_buffer) = listener.async_accept(address_buffer).await;
-        let peer_address = temp_address_buffer.as_socket_addr();
-        address_buffer = temp_address_buffer.into_uninit();
-
-        let stream = result.context("Accept")?;
+        let (stream, peer_address) = match listener.async_accept(address_buffer).await {
+            Ok((stream, address)) => {
+                let peer_address = address.as_socket_addr();
+                address_buffer = address.into_uninit();
+                (stream, peer_address)
+            }
+            Err((e, _address)) => {
+                return Err(e).context("Accept");
+            }
+        };
         println!("Accepted connection from {}", peer_address);
 
         let (result, temp_buffer) = copy_all(stream, buffer).await;

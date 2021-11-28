@@ -14,7 +14,7 @@ use std::{
     task::{Context, Poll, Wake},
 };
 
-use address::Uninitialized;
+use address::{Initialized, Uninitialized};
 use buffers::BufferRawParts;
 use io_uring::{opcode, types, IoUring};
 use once_cell::unsync::Lazy;
@@ -185,6 +185,9 @@ impl Runtime {
     }
 }
 
+type AcceptResult =
+    Result<(TcpStream, SocketAddress<Initialized>), (std::io::Error, SocketAddress<Uninitialized>)>;
+
 impl Shared {
     fn take_token(
         &self,
@@ -212,42 +215,33 @@ impl Shared {
         cx: &mut Context<'_>,
         token: usize,
     ) -> Option<(BufferRawParts, std::io::Result<usize>)> {
-        match self.take_token(cx, token) {
-            Some((data, result)) => {
-                let buffer_parts = match data {
-                    AssociatedData::Buffer(buffer_parts) => buffer_parts,
-                    _ => unreachable!(),
-                };
+        let (data, result) = self.take_token(cx, token)?;
 
-                Some((buffer_parts, result))
-            }
-            None => None,
-        }
+        let buffer_parts = match data {
+            AssociatedData::Buffer(buffer_parts) => buffer_parts,
+            _ => unreachable!(),
+        };
+
+        Some((buffer_parts, result))
     }
 
-    fn connection_ready(
-        &self,
-        cx: &mut Context<'_>,
-        token: usize,
-    ) -> Option<(
-        std::io::Result<TcpStream>,
-        SocketAddress<address::Initialized>,
-    )> {
-        match self.take_token(cx, token) {
-            Some((data, result)) => {
-                let address = match data {
-                    AssociatedData::Address(address) => address,
-                    _ => unreachable!(),
-                };
-                // Safety: the address is initialized by the io-uring.
+    fn connection_ready(&self, cx: &mut Context<'_>, token: usize) -> Option<AcceptResult> {
+        let (data, result) = self.take_token(cx, token)?;
+        let address = match data {
+            AssociatedData::Address(address) => address,
+            _ => unreachable!(),
+        };
+        Some(match result {
+            Ok(fd) => {
+                // Safety: `accept` returns a file descriptor of the accepted
+                // connection.
+                let stream = unsafe { TcpStream::from_raw_fd(fd as _) };
+                // Safety: `accept` assigns correct address.
                 let address = unsafe { address.assume_init() };
-                Some((
-                    result.map(|fd| unsafe { TcpStream::from_raw_fd(fd as _) }),
-                    address,
-                ))
+                Ok((stream, address))
             }
-            None => None,
-        }
+            Err(error) => Err((error, address)),
+        })
     }
 }
 

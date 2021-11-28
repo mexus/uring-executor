@@ -4,7 +4,10 @@ use std::{
     task::Poll,
 };
 
-use crate::{with_shared, SocketAddress};
+use crate::{
+    address::{Initialized, Uninitialized},
+    with_shared, SocketAddress,
+};
 
 /// A future which resolves into a new incoming connection.
 pub struct AcceptFuture {
@@ -12,10 +15,10 @@ pub struct AcceptFuture {
 }
 
 impl Future for AcceptFuture {
-    type Output = (
-        std::io::Result<TcpStream>,
-        SocketAddress<crate::address::Initialized>,
-    );
+    type Output = Result<
+        (TcpStream, SocketAddress<Initialized>),
+        (std::io::Error, SocketAddress<Uninitialized>),
+    >;
 
     fn poll(
         mut self: std::pin::Pin<&mut Self>,
@@ -23,7 +26,7 @@ impl Future for AcceptFuture {
     ) -> std::task::Poll<Self::Output> {
         let token = self.token.take().expect("polled after completion");
         match crate::with_shared(|shared| shared.connection_ready(cx, token)) {
-            Some((result, address)) => Poll::Ready((result, address)),
+            Some(result) => Poll::Ready(result),
             None => {
                 self.token = Some(token);
                 Poll::Pending

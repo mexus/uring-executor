@@ -3,6 +3,7 @@
 use std::{
     alloc::Layout,
     marker::PhantomData,
+    mem::forget,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     ptr::NonNull,
 };
@@ -79,11 +80,14 @@ impl SocketAddress<Uninitialized> {
     ///
     /// The address must have been filled either by a user or by a system call.
     pub(crate) unsafe fn assume_init(self) -> SocketAddress<Initialized> {
-        SocketAddress {
+        let new = SocketAddress {
             socket_address: self.socket_address,
             address_length: self.address_length,
             _pd: PhantomData,
-        }
+        };
+        // Do not run the destructor, otherwise the memory will be freed twice.
+        forget(self);
+        new
     }
 }
 
@@ -101,16 +105,19 @@ impl<Marker> SocketAddress<Marker> {
     /// Changes the marker type to the [Uninitialized] without actually changing
     /// any data fields.
     pub fn into_uninit(self) -> SocketAddress<Uninitialized> {
-        SocketAddress {
+        let new = SocketAddress {
             socket_address: self.socket_address,
             address_length: self.address_length,
             _pd: PhantomData,
-        }
+        };
+        // Do not run the destructor, otherwise the memory will be freed twice.
+        forget(self);
+        new
     }
 
     /// Fills the [SocketAddress] with the provided address.
     pub fn fill(mut self, address: SocketAddr) -> SocketAddress<Initialized> {
-        match address {
+        let new = match address {
             SocketAddr::V4(socket_addr) => {
                 // Safety: the address is at the very least zero-initialized.
                 let socket_address =
@@ -149,6 +156,10 @@ impl<Marker> SocketAddress<Marker> {
                 // Port (network bytes order, i.e. big endian).
                 socket_address.sin6_port = socket_addr.port().to_be();
 
+                // Other fields.
+                socket_address.sin6_flowinfo = socket_addr.flowinfo();
+                socket_address.sin6_scope_id = socket_addr.scope_id();
+
                 // Safety: the length is at the very least zero-initialized.
                 let address_length = unsafe { self.address_length.as_mut() };
 
@@ -160,7 +171,10 @@ impl<Marker> SocketAddress<Marker> {
                     _pd: PhantomData,
                 }
             }
-        }
+        };
+        // Do not run the destructor, otherwise the memory will be freed twice.
+        forget(self);
+        new
     }
 }
 
@@ -205,5 +219,23 @@ impl From<&'_ SocketAddress<Initialized>> for SocketAddr {
 impl From<SocketAddr> for SocketAddress<Initialized> {
     fn from(address: SocketAddr) -> Self {
         SocketAddress::new().fill(address)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn conversion() {
+        let original = SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::new(0, 1, 2, 3, 4, 5, 6, 7),
+            99,
+            13,
+            7401,
+        ));
+        let converted = SocketAddress::from(original);
+        let converted_back = converted.as_socket_addr();
+        assert_eq!(original, converted_back);
     }
 }

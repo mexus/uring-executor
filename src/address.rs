@@ -23,6 +23,9 @@ pub struct Initialized;
 /// This types is used as a marker for maybe uninitialized socket address.
 pub struct Uninitialized;
 
+const AF_INET: libc::sa_family_t = libc::AF_INET as libc::sa_family_t;
+const AF_INET6: libc::sa_family_t = libc::AF_INET6 as libc::sa_family_t;
+
 /// A placeholder for an accepted address.
 pub struct SocketAddress<InitializationMarker> {
     pub(crate) socket_address: NonNull<libc::sockaddr>,
@@ -30,6 +33,8 @@ pub struct SocketAddress<InitializationMarker> {
     _pd: PhantomData<InitializationMarker>,
 }
 
+// Safety: socket addresses (and their lengths) are inherently safe to send/be
+// accessed from multiple threads.
 unsafe impl<Marker> Send for SocketAddress<Marker> {}
 unsafe impl<Marker> Sync for SocketAddress<Marker> {}
 
@@ -51,6 +56,10 @@ impl Default for SocketAddress<Uninitialized> {
 impl SocketAddress<Uninitialized> {
     /// Allocates memory for an address.
     pub fn new() -> Self {
+        // Safety: it is OK to allocate non-zero sized data.
+        static_assertions::const_assert_ne!(ADDRESS_LAYOUT.size(), 0);
+        static_assertions::const_assert_ne!(LENGTH_LAYOUT.size(), 0);
+
         let socket_address = NonNull::new(unsafe { std::alloc::alloc(ADDRESS_LAYOUT) })
             .expect("Unable to allocate space for a socket address")
             .cast();
@@ -98,17 +107,70 @@ impl<Marker> SocketAddress<Marker> {
             _pd: PhantomData,
         }
     }
+
+    /// Fills the [SocketAddress] with the provided address.
+    pub fn fill(mut self, address: SocketAddr) -> SocketAddress<Initialized> {
+        match address {
+            SocketAddr::V4(socket_addr) => {
+                // Safety: the address is at the very least zero-initialized.
+                let socket_address =
+                    unsafe { self.socket_address.cast::<libc::sockaddr_in>().as_mut() };
+                // Address family (ipv4).
+                socket_address.sin_family = AF_INET;
+
+                // IP address.
+                let [a, b, c, d] = socket_addr.ip().octets();
+                socket_address.sin_addr.s_addr = u32::from_ne_bytes([a, b, c, d]);
+
+                // Port (network bytes order, i.e. big endian).
+                socket_address.sin_port = socket_addr.port().to_be();
+
+                // Safety: the length is at the very least zero-initialized.
+                let address_length = unsafe { self.address_length.as_mut() };
+
+                // Size (length) of the address structure (ipv4 -> sockaddr_in).
+                *address_length = std::mem::size_of::<libc::sockaddr_in>() as u32;
+                SocketAddress {
+                    socket_address: self.socket_address,
+                    address_length: self.address_length,
+                    _pd: PhantomData,
+                }
+            }
+            SocketAddr::V6(socket_addr) => {
+                // Safety: the address is at the very least zero-initialized.
+                let socket_address =
+                    unsafe { self.socket_address.cast::<libc::sockaddr_in6>().as_mut() };
+                // Address family (ipv6).
+                socket_address.sin6_family = AF_INET6;
+
+                // IP address.
+                socket_address.sin6_addr.s6_addr = socket_addr.ip().octets();
+
+                // Port (network bytes order, i.e. big endian).
+                socket_address.sin6_port = socket_addr.port().to_be();
+
+                // Safety: the length is at the very least zero-initialized.
+                let address_length = unsafe { self.address_length.as_mut() };
+
+                // Size (length) of the address structure (ipv6 -> sockaddr_in6).
+                *address_length = std::mem::size_of::<libc::sockaddr_in6>() as u32;
+                SocketAddress {
+                    socket_address: self.socket_address,
+                    address_length: self.address_length,
+                    _pd: PhantomData,
+                }
+            }
+        }
+    }
 }
 
 impl SocketAddress<Initialized> {
     /// Converts [SocketAddress] into a [SocketAddr].
     pub fn as_socket_addr(&self) -> SocketAddr {
-        const AF_INET: libc::sa_family_t = libc::AF_INET as libc::sa_family_t;
-        const AF_INET6: libc::sa_family_t = libc::AF_INET6 as libc::sa_family_t;
-
         let family = unsafe { self.socket_address.as_ref() }.sa_family;
         match family {
             AF_INET => {
+                // Safety: AF_INET family means ipv4 address => sockaddr_in.
                 let socket_address =
                     unsafe { self.socket_address.cast::<libc::sockaddr_in>().as_ref() };
                 let [a, b, c, d] = socket_address.sin_addr.s_addr.to_ne_bytes();
@@ -117,9 +179,9 @@ impl SocketAddress<Initialized> {
                 SocketAddr::V4(SocketAddrV4::new(ip, port))
             }
             AF_INET6 => {
+                // Safety: AF_INET6 family means ipv6 address => sockaddr_in6.
                 let socket_address =
                     unsafe { self.socket_address.cast::<libc::sockaddr_in6>().as_ref() };
-                println!("{:?}", socket_address.sin6_addr.s6_addr);
                 let ip = Ipv6Addr::from(socket_address.sin6_addr.s6_addr);
                 let port = u16::from_be(socket_address.sin6_port);
                 SocketAddr::V6(SocketAddrV6::new(

@@ -1,4 +1,4 @@
-//! Experimental ui_uring-driven asynchronous runtime.
+//! Experimental io_uring-driven asynchronous runtime.
 
 #![deny(missing_docs)]
 

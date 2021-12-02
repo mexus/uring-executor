@@ -61,18 +61,18 @@ impl Handle {
 
 /// An io_uring-driven asynchronous runtime.
 pub struct Runtime {
-    ring: IoUring,
-
+    // ring: IoUring,
     shared: Arc<Shared>,
 }
 
-#[derive(Default)]
 struct Shared {
     /// Pending to submit events.
     to_submit: Mutex<VecDeque<io_uring::squeue::Entry>>,
 
     pending_events: Mutex<Slab<PendingEvent>>,
     ready_events: Mutex<HashMap<usize, EventResult>>,
+
+    ring: Mutex<IoUring>,
 }
 
 enum EventResult {
@@ -94,8 +94,12 @@ impl Runtime {
     /// backend.
     pub fn new(ring: IoUring) -> Self {
         Self {
-            ring,
-            shared: Arc::new(Shared::default()),
+            shared: Arc::new(Shared {
+                pending_events: Mutex::default(),
+                ready_events: Mutex::default(),
+                to_submit: Mutex::default(),
+                ring: Mutex::new(ring),
+            }),
         }
     }
 
@@ -140,21 +144,35 @@ impl Runtime {
             let submitted_everything = self.submit_pending();
 
             let awaken = original_waker.0.load(std::sync::atomic::Ordering::Relaxed);
-            let consumed_entires = self
-                .ring
-                .submit_and_wait(if awaken { 0 } else { 1 })
-                .expect("Unexpected uring I/O error");
-            for completed in self.ring.completion() {
-                let result = completed.result();
-                let result =
-                    usize::try_from(result).map_err(|_| std::io::Error::from_raw_os_error(-result));
-                let token = completed.user_data() as usize;
-                self.shared
-                    .ready_events
-                    .lock()
-                    .insert(token, EventResult::IoEvent(result));
-                if let Some(waker) = self.shared.pending_events.lock()[token].waker.take() {
-                    waker.wake()
+            let consumed_entires;
+            {
+                let mut ring = self.shared.ring.lock();
+                {
+                    let mut to_submit = self.shared.to_submit.lock();
+                    while let Some(entry) = to_submit.pop_front() {
+                        if unsafe { ring.submission().push(&entry) }.is_err() {
+                            to_submit.push_front(entry);
+                            break;
+                        }
+                    }
+                }
+
+                consumed_entires = ring
+                    .submit_and_wait(if awaken { 0 } else { 1 })
+                    .expect("Unexpected uring I/O error");
+
+                for completed in ring.completion() {
+                    let result = completed.result();
+                    let result = usize::try_from(result)
+                        .map_err(|_| std::io::Error::from_raw_os_error(-result));
+                    let token = completed.user_data() as usize;
+                    self.shared
+                        .ready_events
+                        .lock()
+                        .insert(token, EventResult::IoEvent(result));
+                    if let Some(waker) = self.shared.pending_events.lock()[token].waker.take() {
+                        waker.wake()
+                    }
                 }
             }
             if consumed_entires != 0 && !submitted_everything {
@@ -175,8 +193,9 @@ impl Runtime {
 
     fn submit_pending(&mut self) -> bool {
         let mut to_submit = self.shared.to_submit.lock();
+        let mut ring = self.shared.ring.lock();
         while let Some(entry) = to_submit.pop_front() {
-            if unsafe { self.ring.submission().push(&entry) }.is_err() {
+            if unsafe { ring.submission().push(&entry) }.is_err() {
                 to_submit.push_front(entry);
                 break;
             }
@@ -366,9 +385,20 @@ impl Shared {
         let mut pending_events = self.pending_events.lock();
         let vacant = pending_events.vacant_entry();
         let token = vacant.key();
-        let entry = entry.user_data(token as u64);
-        self.to_submit.lock().push_back(entry);
         vacant.insert(event);
+        let entry = entry.user_data(token as u64);
+        // When the ring is not locked and submission queue is not full, add the
+        // entry directly to the queue. Otherwise fall back to the supplementary
+        // `to_submit` queue.
+        if let Some(mut ring) = self.ring.try_lock() {
+            // Safety: the possible pointers from the `event` are already stored
+            // in the `pending_events` storage.
+            if unsafe { ring.submission().push(&entry) }.is_ok() {
+                return token;
+            }
+        }
+        self.to_submit.lock().push_back(entry);
+
         token
     }
 }
@@ -450,11 +480,12 @@ impl Drop for Runtime {
         // Ensure that there are no pending requests in the queues which
         // reference the buffers we are going to drop when `self.events` is
         // dropped.
-        let pending_events = self.ring.submission().len();
-        if let Err(_e) = self.ring.submit_and_wait(pending_events) {
+        let mut ring = self.shared.ring.lock();
+        let pending_events = ring.submission().len();
+        if let Err(_e) = ring.submit_and_wait(pending_events) {
             // TODO: log the error
             return;
         };
-        self.ring.completion().for_each(drop);
+        ring.completion().for_each(drop);
     }
 }

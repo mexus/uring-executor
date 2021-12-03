@@ -307,8 +307,9 @@ impl Shared {
             waker: None,
         };
 
-        // Safety: 
-        let token = unsafe {self.add_event(entry, event)};
+        // Safety: event owns the data pointed by the entry.
+        let event = unsafe {AugmentedSubmitEntry::new(entry, event)};
+        let token =  self.add_event(event);
         IoFuture::with_token(token)
     }
 
@@ -353,8 +354,9 @@ impl Shared {
             waker: None,
         };
 
-        // Safety: entry owns data pointed by the entry.
-        let token = unsafe {self.add_event(entry, event)};
+        // Safety: event owns the data pointed by the entry.
+        let event = unsafe {AugmentedSubmitEntry::new(entry, event)};
+        let token =  self.add_event(event);
 
         IoFuture::with_token(token)
     }
@@ -380,7 +382,8 @@ impl Shared {
         };
 
         // Safety: event owns the data pointed by the entry.
-        let token = unsafe {self.add_event(entry, event)};
+        let event = unsafe {AugmentedSubmitEntry::new(entry, event)};
+        let token =  self.add_event(event);
 
         AcceptFuture { token: Some(token) }
     }
@@ -388,7 +391,7 @@ impl Shared {
     /// # Safety
     ///
     /// The `event` must own the data which is pointed by the `entry`.
-    unsafe fn add_event(&self, entry: io_uring::squeue::Entry, event: PendingEvent) -> usize {
+    fn add_event(&self, AugmentedSubmitEntry { entry, event }: AugmentedSubmitEntry) -> usize {
         let mut pending_events = self.pending_events.lock();
         let vacant = pending_events.vacant_entry();
         let token = vacant.key();
@@ -494,5 +497,24 @@ impl Drop for Runtime {
             return;
         };
         ring.completion().for_each(drop);
+    }
+}
+
+/// An entry for the submission queue, augmented with "description" of the entry
+/// and an owned data associated with it.
+pub(crate) struct AugmentedSubmitEntry {
+    entry: io_uring::squeue::Entry,
+    event: PendingEvent,
+}
+
+impl AugmentedSubmitEntry {
+    /// Creates an [AugmentedSubmitEntry] which stores an uring entry and the
+    /// data associated with it.
+    ///
+    /// # Safety
+    ///
+    /// The `event` must own the data which is pointed by the `entry`.
+    pub unsafe fn new(entry: io_uring::squeue::Entry, event: PendingEvent) -> Self {
+        Self { entry, event }
     }
 }

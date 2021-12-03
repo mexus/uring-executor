@@ -91,7 +91,9 @@ unsafe impl Buffer for Vec<u8> {
             capacity,
         }: BufferRawParts,
     ) -> Self {
-        Vec::from_raw_parts(begin.as_ptr(), length, capacity)
+        // The provided parts are created from the `Vec<_>`.
+        unsafe {
+        Vec::from_raw_parts(begin.as_ptr(), length, capacity)}
     }
 }
 
@@ -123,8 +125,9 @@ unsafe impl Buffer for Box<[u8]> {
     }
 
     unsafe fn reconstruct(parts: BufferRawParts) -> Self {
-        let vec = <Vec<u8> as Buffer>::reconstruct(parts);
-        vec.into_boxed_slice()
+        let ptr =  std::ptr::slice_from_raw_parts_mut(parts.begin.as_ptr(), parts.length);
+        // Safety: the pointer is re-created from the `Box<[u8]>`.
+        unsafe {Box::from_raw(ptr)}
     }
 }
 
@@ -141,6 +144,8 @@ unsafe impl Buffer for &'static [u8] {
 
     fn split_into_raw_parts(self) -> BufferRawParts {
         BufferRawParts {
+            // note: casting a `*const _` to `*mut _` is OK since we're never
+            // modifying the slice's context.
             begin: NonNull::new(self.as_ptr() as *mut _)
                 .expect("Slices are never based on a null pointer"),
             length: self.len(),
@@ -149,6 +154,7 @@ unsafe impl Buffer for &'static [u8] {
     }
 
     unsafe fn reconstruct(parts: BufferRawParts) -> Self {
-        std::slice::from_raw_parts(parts.begin.as_ptr(), parts.length)
+        // Safety: the slice is reconstructed from a slice.
+        unsafe {std::slice::from_raw_parts(parts.begin.as_ptr(), parts.length)}
     }
 }

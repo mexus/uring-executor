@@ -1,6 +1,7 @@
 //! Experimental io_uring-driven asynchronous runtime.
 
 #![deny(missing_docs)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 use std::{
     cell::RefCell,
@@ -306,7 +307,8 @@ impl Shared {
             waker: None,
         };
 
-        let token = self.add_event(entry, event);
+        // Safety: 
+        let token = unsafe {self.add_event(entry, event)};
         IoFuture::with_token(token)
     }
 
@@ -351,7 +353,8 @@ impl Shared {
             waker: None,
         };
 
-        let token = self.add_event(entry, event);
+        // Safety: entry owns data pointed by the entry.
+        let token = unsafe {self.add_event(entry, event)};
 
         IoFuture::with_token(token)
     }
@@ -376,12 +379,16 @@ impl Shared {
             waker: None,
         };
 
-        let token = self.add_event(entry, event);
+        // Safety: event owns the data pointed by the entry.
+        let token = unsafe {self.add_event(entry, event)};
 
         AcceptFuture { token: Some(token) }
     }
 
-    fn add_event(&self, entry: io_uring::squeue::Entry, event: PendingEvent) -> usize {
+    /// # Safety
+    ///
+    /// The `event` must own the data which is pointed by the `entry`.
+    unsafe fn add_event(&self, entry: io_uring::squeue::Entry, event: PendingEvent) -> usize {
         let mut pending_events = self.pending_events.lock();
         let vacant = pending_events.vacant_entry();
         let token = vacant.key();

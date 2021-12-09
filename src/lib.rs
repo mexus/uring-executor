@@ -25,6 +25,7 @@ mod accept;
 pub mod address;
 pub mod buffers;
 mod read_write;
+mod uring_wrapper;
 
 pub use accept::{AcceptFuture, AcceptPrepared, ListenerExt};
 pub use address::SocketAddress;
@@ -51,12 +52,8 @@ pub struct Runtime {
 struct Shared {
     pending_events: Mutex<Slab<PendingEvent>>,
     ready_events: Mutex<HashMap<usize, EventResult>>,
-
     wait_for_slot: Mutex<VecDeque<std::task::Waker>>,
-
-    submission_queue_lock: Mutex<()>,
-
-    ring: IoUring,
+    ring: uring_wrapper::Uring,
 }
 
 enum EventResult {
@@ -81,9 +78,8 @@ impl Runtime {
             shared: Arc::new(Shared {
                 pending_events: Mutex::default(),
                 ready_events: Mutex::default(),
-                ring,
+                ring: uring_wrapper::Uring::new(ring),
                 wait_for_slot: Mutex::default(),
-                submission_queue_lock: Mutex::default(),
             }),
         }
     }
@@ -102,8 +98,8 @@ impl Runtime {
             *shared.borrow_mut() = Some(self.shared.clone());
         });
 
-        // Pin down the future. Since we shadow the original `future`, it can't
-        // be accessed directly anymore.
+        // Pin down the future. Safety: since we shadow the original `future`,
+        // it can't be accessed directly anymore.
         let mut future = unsafe { Pin::new_unchecked(&mut future) };
         let ready = loop {
             if original_waker
@@ -123,21 +119,14 @@ impl Runtime {
             ring.submit_and_wait(if awaken { 0 } else { 1 })
                 .expect("Unexpected uring I/O error");
 
-            let queue_is_full = {
-                let _guard = self.shared.submission_queue_lock.lock();
-                // Safety: the guard has been acquired.
-                unsafe { ring.submission_shared() }.is_full()
-            };
-            if !queue_is_full {
+            if !ring.submission_is_full() {
                 // Let's wake the futures, since the submission queue has some space.
                 while let Some(waker) = self.shared.wait_for_slot.lock().pop_front() {
                     waker.wake()
                 }
             }
 
-            // Safety: this is the only place (apart from the `Drop`
-            // implementation) where completion queue is accessed.
-            for completed in unsafe { ring.completion_shared() } {
+            for completed in ring.completed_entries() {
                 let result = completed.result();
                 let result =
                     usize::try_from(result).map_err(|_| std::io::Error::from_raw_os_error(-result));
@@ -234,14 +223,8 @@ impl Shared {
     ) -> bool {
         let ring = &self.ring;
 
-        let result = {
-            let _queue_guard = self.submission_queue_lock.lock();
-            // Safety: the guard for "submission queue" has been acquired.
-            let mut queue = unsafe { ring.submission_shared() };
-            // Safety: the buffer is stored properly.
-            unsafe { queue.push(entry) }
-        };
-        if result.is_ok() {
+        // Safety: the buffer is stored properly.
+        if unsafe { ring.submission_push(entry) }.is_ok() {
             true
         } else {
             // The submission queue is full!
@@ -273,11 +256,7 @@ impl Drop for Runtime {
         // reference the buffers we are going to drop when `self.events` is
         // dropped.
         let ring = &self.shared.ring;
-        let pending_events = {
-            let _guard = self.shared.submission_queue_lock.lock();
-            // Safety: the guard for "submission queue" has been acquired.
-            unsafe { ring.submission_shared() }.len()
-        };
+        let pending_events = ring.submission_len();
 
         if let Err(_e) = ring.submit_and_wait(pending_events) {
             // TODO: log the error
@@ -285,6 +264,6 @@ impl Drop for Runtime {
         };
         // Safety: since we've got here, it means the main loop has been
         // terminated and we are the only possible user of the completion queue.
-        unsafe { ring.completion_shared() }.for_each(drop);
+        ring.completed_entries().for_each(drop);
     }
 }

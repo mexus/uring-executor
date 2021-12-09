@@ -92,8 +92,7 @@ unsafe impl Buffer for Vec<u8> {
         }: BufferRawParts,
     ) -> Self {
         // The provided parts are created from the `Vec<_>`.
-        unsafe {
-        Vec::from_raw_parts(begin.as_ptr(), length, capacity)}
+        unsafe { Vec::from_raw_parts(begin.as_ptr(), length, capacity) }
     }
 }
 
@@ -125,9 +124,9 @@ unsafe impl Buffer for Box<[u8]> {
     }
 
     unsafe fn reconstruct(parts: BufferRawParts) -> Self {
-        let ptr =  std::ptr::slice_from_raw_parts_mut(parts.begin.as_ptr(), parts.length);
+        let ptr = std::ptr::slice_from_raw_parts_mut(parts.begin.as_ptr(), parts.length);
         // Safety: the pointer is re-created from the `Box<[u8]>`.
-        unsafe {Box::from_raw(ptr)}
+        unsafe { Box::from_raw(ptr) }
     }
 }
 
@@ -155,6 +154,6 @@ unsafe impl Buffer for &'static [u8] {
 
     unsafe fn reconstruct(parts: BufferRawParts) -> Self {
         // Safety: the slice is reconstructed from a slice.
-        unsafe {std::slice::from_raw_parts(parts.begin.as_ptr(), parts.length)}
+        unsafe { std::slice::from_raw_parts(parts.begin.as_ptr(), parts.length) }
     }
 }

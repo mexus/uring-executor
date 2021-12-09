@@ -7,17 +7,16 @@ use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
     future::Future,
-    net::{TcpListener, TcpStream},
-    os::unix::prelude::{AsRawFd, FromRawFd},
+    net::TcpStream,
+    os::unix::prelude::FromRawFd,
     pin::Pin,
-    slice::SliceIndex,
     sync::{atomic::AtomicBool, Arc},
     task::{Context, Poll, Wake},
 };
 
 use address::{Initialized, Uninitialized};
 use buffers::BufferRawParts;
-use io_uring::{opcode, types, IoUring};
+use io_uring::IoUring;
 use once_cell::unsync::Lazy;
 use parking_lot::Mutex;
 use slab::Slab;
@@ -27,7 +26,7 @@ pub mod address;
 pub mod buffers;
 mod read_write;
 
-pub use accept::{AcceptFuture, ListenerExt};
+pub use accept::{AcceptFuture, AcceptPrepared, ListenerExt};
 pub use address::SocketAddress;
 pub use buffers::{Buffer, BufferMut};
 pub use read_write::{IoFuture, StreamExt};
@@ -43,23 +42,6 @@ where
     SHARED.with(|maybe_shared| f(maybe_shared.borrow().as_ref().expect("Executor is not set")))
 }
 
-/// A detached handle that can be used to create futures.
-pub struct Handle {
-    inner: Arc<Shared>,
-}
-
-impl Handle {
-    /// Creates an execution handle.
-    ///
-    /// # Panics
-    ///
-    /// Panics when executed out of the runtime's context.
-    pub fn out_of_thin_air() -> Self {
-        let shared = with_shared(Arc::clone);
-        Self { inner: shared }
-    }
-}
-
 /// An io_uring-driven asynchronous runtime.
 pub struct Runtime {
     // ring: IoUring,
@@ -67,13 +49,14 @@ pub struct Runtime {
 }
 
 struct Shared {
-    /// Pending to submit events.
-    to_submit: Mutex<VecDeque<io_uring::squeue::Entry>>,
-
     pending_events: Mutex<Slab<PendingEvent>>,
     ready_events: Mutex<HashMap<usize, EventResult>>,
 
-    ring: Mutex<IoUring>,
+    wait_for_slot: Mutex<VecDeque<std::task::Waker>>,
+
+    submission_queue_lock: Mutex<()>,
+
+    ring: IoUring,
 }
 
 enum EventResult {
@@ -98,17 +81,10 @@ impl Runtime {
             shared: Arc::new(Shared {
                 pending_events: Mutex::default(),
                 ready_events: Mutex::default(),
-                to_submit: Mutex::default(),
-                ring: Mutex::new(ring),
+                ring,
+                wait_for_slot: Mutex::default(),
+                submission_queue_lock: Mutex::default(),
             }),
-        }
-    }
-
-    /// Creates a handle to spawn the futures outside of the main execution
-    /// context.
-    pub fn handle(&self) -> Handle {
-        Handle {
-            inner: self.shared.clone(),
         }
     }
 
@@ -140,48 +116,39 @@ impl Runtime {
                 };
             }
 
-            // The future might have registered some events. Add them to the
-            // queue!
-            let submitted_everything = self.submit_pending();
-
             let awaken = original_waker.0.load(std::sync::atomic::Ordering::Relaxed);
-            let consumed_entires;
-            {
-                let mut ring = self.shared.ring.lock();
-                {
-                    let mut to_submit = self.shared.to_submit.lock();
-                    while let Some(entry) = to_submit.pop_front() {
-                        if unsafe { ring.submission().push(&entry) }.is_err() {
-                            to_submit.push_front(entry);
-                            break;
-                        }
-                    }
-                }
 
-                consumed_entires = ring
-                    .submit_and_wait(if awaken { 0 } else { 1 })
-                    .expect("Unexpected uring I/O error");
+            let ring = &self.shared.ring;
 
-                for completed in ring.completion() {
-                    let result = completed.result();
-                    let result = usize::try_from(result)
-                        .map_err(|_| std::io::Error::from_raw_os_error(-result));
-                    let token = completed.user_data() as usize;
-                    self.shared
-                        .ready_events
-                        .lock()
-                        .insert(token, EventResult::IoEvent(result));
-                    if let Some(waker) = self.shared.pending_events.lock()[token].waker.take() {
-                        waker.wake()
-                    }
+            ring.submit_and_wait(if awaken { 0 } else { 1 })
+                .expect("Unexpected uring I/O error");
+
+            let queue_is_full = {
+                let _guard = self.shared.submission_queue_lock.lock();
+                // Safety: the guard has been acquired.
+                unsafe { ring.submission_shared() }.is_full()
+            };
+            if !queue_is_full {
+                // Let's wake the futures, since the submission queue has some space.
+                while let Some(waker) = self.shared.wait_for_slot.lock().pop_front() {
+                    waker.wake()
                 }
             }
-            if consumed_entires != 0 && !submitted_everything {
-                // If we have something to submit (!submitted_everything) and
-                // the "submit_and_wait" has consumed some entries
-                // (consumed_entires != 0), we've got a chance to submit pending
-                // entries.
-                self.submit_pending();
+
+            // Safety: this is the only place (apart from the `Drop`
+            // implementation) where completion queue is accessed.
+            for completed in unsafe { ring.completion_shared() } {
+                let result = completed.result();
+                let result =
+                    usize::try_from(result).map_err(|_| std::io::Error::from_raw_os_error(-result));
+                let token = completed.user_data() as usize;
+                self.shared
+                    .ready_events
+                    .lock()
+                    .insert(token, EventResult::IoEvent(result));
+                if let Some(waker) = self.shared.pending_events.lock()[token].waker.take() {
+                    waker.wake()
+                }
             }
         };
 
@@ -190,18 +157,6 @@ impl Runtime {
         });
 
         ready
-    }
-
-    fn submit_pending(&mut self) -> bool {
-        let mut to_submit = self.shared.to_submit.lock();
-        let mut ring = self.shared.ring.lock();
-        while let Some(entry) = to_submit.pop_front() {
-            if unsafe { ring.submission().push(&entry) }.is_err() {
-                to_submit.push_front(entry);
-                break;
-            }
-        }
-        to_submit.is_empty()
     }
 }
 
@@ -266,207 +221,34 @@ impl Shared {
 }
 
 impl Shared {
-    /// Creates a future that will write some bytes to the [TcpStream] from the
-    /// provided buffer.
+    /// Tries to add an event to the submission queue.
     ///
-    /// # Notes
-    ///
-    /// 1. No more than first [u32::MAX] bytes of the buffer (after `range`
-    ///    applied) will be sent.
-    /// 2. If applying the `range` results in an empty slice, the returned
-    ///    future will be immediately ready.
-    /// 3. See the `Panics` sections.
-    ///
-    /// # Panics
-    ///
-    /// If the `range` is out of bounds of the provided buffer, the function
-    /// will panic.
-    pub fn socket_write<B, R>(&self, socket: &TcpStream, buffer: B, range: R) -> IoFuture<B>
-    where
-        B: Buffer,
-        R: SliceIndex<[u8], Output = [u8]>,
-    {
-        let slice = match buffer.slice().get(range) {
-            Some(slice) => slice,
-            None => panic!("Range out of bounds"),
-        };
-        if slice.is_empty() {
-            return IoFuture::noop(buffer);
-        }
-
-        let entry = opcode::Write::new(
-            types::Fd(socket.as_raw_fd()),
-            slice.as_ptr(),
-            u32::try_from(slice.len()).unwrap_or(u32::MAX),
-        )
-        .build();
-
-        let buffer_parts = buffer.split_into_raw_parts();
-        let event = PendingEvent {
-            data: AssociatedData::Buffer(buffer_parts),
-            waker: None,
-        };
-
-        // Safety: event owns the data pointed by the entry.
-        let event = unsafe {AugmentedSubmitEntry::new(entry, event)};
-        let token =  self.add_event(event);
-        IoFuture::with_token(token)
-    }
-
-    /// Creates a future that will read some bytes from the [TcpStream] into the
-    /// provided buffer.
-    ///
-    /// # Notes
-    ///
-    /// 1. No more than first [u32::MAX] bytes of the buffer (after `range`
-    ///    applied) will be filled.
-    /// 2. If applying the `range` results in an empty slice, the returned
-    ///    future will be immediately ready.
-    /// 3. See the `Panics` sections.
-    ///
-    /// # Panics
-    ///
-    /// If the `range` is out of bounds of the provided buffer, the function
-    /// will panic.
-    pub fn socket_read<B, R>(&self, socket: &TcpStream, mut buffer: B, range: R) -> IoFuture<B>
-    where
-        B: BufferMut,
-        R: SliceIndex<[u8], Output = [u8]>,
-    {
-        let slice = match buffer.slice_mut().get_mut(range) {
-            Some(slice) => slice,
-            None => panic!("Range out of bounds"),
-        };
-        if slice.is_empty() {
-            return IoFuture::noop(buffer);
-        }
-
-        let entry = opcode::Read::new(
-            types::Fd(socket.as_raw_fd()),
-            slice.as_mut_ptr(),
-            u32::try_from(slice.len()).unwrap_or(u32::MAX),
-        )
-        .build();
-
-        let buffer_parts = buffer.split_into_raw_parts();
-        let event = PendingEvent {
-            data: AssociatedData::Buffer(buffer_parts),
-            waker: None,
-        };
-
-        // Safety: event owns the data pointed by the entry.
-        let event = unsafe {AugmentedSubmitEntry::new(entry, event)};
-        let token =  self.add_event(event);
-
-        IoFuture::with_token(token)
-    }
-
-    /// Creates a future that will resolve when a new connection arrives.
-    pub fn accept_socket<Marker>(
-        &self,
-        socket: &TcpListener,
-        address: SocketAddress<Marker>,
-    ) -> AcceptFuture {
-        let address = address.reset();
-
-        let entry = opcode::Accept::new(
-            types::Fd(socket.as_raw_fd()),
-            address.socket_address.as_ptr(),
-            address.address_length.as_ptr(),
-        )
-        .build();
-
-        let event = PendingEvent {
-            data: AssociatedData::Address(address.into_uninit()),
-            waker: None,
-        };
-
-        // Safety: event owns the data pointed by the entry.
-        let event = unsafe {AugmentedSubmitEntry::new(entry, event)};
-        let token =  self.add_event(event);
-
-        AcceptFuture { token: Some(token) }
-    }
-
     /// # Safety
     ///
-    /// The `event` must own the data which is pointed by the `entry`.
-    fn add_event(&self, AugmentedSubmitEntry { entry, event }: AugmentedSubmitEntry) -> usize {
-        let mut pending_events = self.pending_events.lock();
-        let vacant = pending_events.vacant_entry();
-        let token = vacant.key();
-        vacant.insert(event);
-        let entry = entry.user_data(token as u64);
-        // When the ring is not locked and submission queue is not full, add the
-        // entry directly to the queue. Otherwise fall back to the supplementary
-        // `to_submit` queue.
-        if let Some(mut ring) = self.ring.try_lock() {
-            // Safety: the possible pointers from the `event` are already stored
-            // in the `pending_events` storage.
-            if unsafe { ring.submission().push(&entry) }.is_ok() {
-                return token;
-            }
-        }
-        self.to_submit.lock().push_back(entry);
-
-        token
-    }
-}
-
-impl Handle {
-    /// Creates a future that will write some bytes to the [TcpStream] from the
-    /// provided buffer.
-    ///
-    /// # Notes
-    ///
-    /// 1. No more than first [u32::MAX] bytes of the buffer (after `range`
-    ///    applied) will be sent.
-    /// 2. If applying the `range` results in an empty slice, the returned
-    ///    future will be immediately ready.
-    /// 3. See the `Panics` sections.
-    ///
-    /// # Panics
-    ///
-    /// If the `range` is out of bounds of the provided buffer, the function
-    /// will panic.
-    pub fn socket_write<B, R>(&self, socket: &TcpStream, buffer: B, range: R) -> IoFuture<B>
-    where
-        B: Buffer,
-        R: SliceIndex<[u8], Output = [u8]>,
-    {
-        self.inner.socket_write(socket, buffer, range)
-    }
-
-    /// Creates a future that will read some bytes from the [TcpStream] into the
-    /// provided buffer.
-    ///
-    /// # Notes
-    ///
-    /// 1. No more than first [u32::MAX] bytes of the buffer (after `range`
-    ///    applied) will be filled.
-    /// 2. If applying the `range` results in an empty slice, the returned
-    ///    future will be immediately ready.
-    /// 3. See the `Panics` sections.
-    ///
-    /// # Panics
-    ///
-    /// If the `range` is out of bounds of the provided buffer, the function
-    /// will panic.
-    pub fn socket_read<B, R>(&self, socket: &TcpStream, buffer: B, range: R) -> IoFuture<B>
-    where
-        B: BufferMut,
-        R: SliceIndex<[u8], Output = [u8]>,
-    {
-        self.inner.socket_read(socket, buffer, range)
-    }
-
-    /// Creates a future that will resolve when a new connection arrives.
-    pub fn accept_socket<Marker>(
+    /// The buffer associated with the [`entry`] must be stored in the
+    /// [Self::pending_events].
+    unsafe fn try_add_event(
         &self,
-        socket: &TcpListener,
-        address: SocketAddress<Marker>,
-    ) -> AcceptFuture {
-        self.inner.accept_socket(socket, address)
+        entry: &io_uring::squeue::Entry,
+        cx: &mut std::task::Context<'_>,
+    ) -> bool {
+        let ring = &self.ring;
+
+        let result = {
+            let _queue_guard = self.submission_queue_lock.lock();
+            // Safety: the guard for "submission queue" has been acquired.
+            let mut queue = unsafe { ring.submission_shared() };
+            // Safety: the buffer is stored properly.
+            unsafe { queue.push(entry) }
+        };
+        if result.is_ok() {
+            true
+        } else {
+            // The submission queue is full!
+            let waker = cx.waker().clone();
+            self.wait_for_slot.lock().push_back(waker);
+            false
+        }
     }
 }
 
@@ -490,31 +272,19 @@ impl Drop for Runtime {
         // Ensure that there are no pending requests in the queues which
         // reference the buffers we are going to drop when `self.events` is
         // dropped.
-        let mut ring = self.shared.ring.lock();
-        let pending_events = ring.submission().len();
+        let ring = &self.shared.ring;
+        let pending_events = {
+            let _guard = self.shared.submission_queue_lock.lock();
+            // Safety: the guard for "submission queue" has been acquired.
+            unsafe { ring.submission_shared() }.len()
+        };
+
         if let Err(_e) = ring.submit_and_wait(pending_events) {
             // TODO: log the error
             return;
         };
-        ring.completion().for_each(drop);
-    }
-}
-
-/// An entry for the submission queue, augmented with "description" of the entry
-/// and an owned data associated with it.
-pub(crate) struct AugmentedSubmitEntry {
-    entry: io_uring::squeue::Entry,
-    event: PendingEvent,
-}
-
-impl AugmentedSubmitEntry {
-    /// Creates an [AugmentedSubmitEntry] which stores an uring entry and the
-    /// data associated with it.
-    ///
-    /// # Safety
-    ///
-    /// The `event` must own the data which is pointed by the `entry`.
-    pub unsafe fn new(entry: io_uring::squeue::Entry, event: PendingEvent) -> Self {
-        Self { entry, event }
+        // Safety: since we've got here, it means the main loop has been
+        // terminated and we are the only possible user of the completion queue.
+        unsafe { ring.completion_shared() }.for_each(drop);
     }
 }

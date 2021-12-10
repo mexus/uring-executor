@@ -25,12 +25,14 @@ mod accept;
 pub mod address;
 pub mod buffers;
 mod read_write;
+mod splice;
 mod uring_wrapper;
 
 pub use accept::{AcceptFuture, AcceptPrepared, ListenerExt};
 pub use address::SocketAddress;
 pub use buffers::{Buffer, BufferMut};
 pub use read_write::{IoFuture, StreamExt};
+pub use splice::{splice, SpliceFuture, SplicePrepared};
 
 thread_local! {
     static SHARED: Lazy<RefCell<Option<Arc<Shared>>>> = Lazy::new(|| RefCell::new(None));
@@ -68,6 +70,7 @@ struct PendingEvent {
 enum AssociatedData {
     Buffer(BufferRawParts),
     Address(SocketAddress<Uninitialized>),
+    NoData,
 }
 
 impl Runtime {

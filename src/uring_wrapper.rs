@@ -69,6 +69,11 @@ impl Uring {
         self.submission_queue().inner.len()
     }
 
+    /// Returns whether the submission queue is empty or not.
+    pub fn submission_is_empty(&self) -> bool {
+        self.submission_queue().inner.is_empty()
+    }
+
     /// Tries to push an entry to the submission queue.
     ///
     /// # Safety

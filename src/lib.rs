@@ -2,6 +2,7 @@
 
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
+#![deny(rustdoc::all)]
 
 use std::{
     cell::RefCell,
@@ -12,10 +13,12 @@ use std::{
     pin::Pin,
     sync::{atomic::AtomicBool, Arc},
     task::{Context, Poll, Wake},
+    thread::JoinHandle,
 };
 
 use address::{Initialized, Uninitialized};
 use buffers::BufferRawParts;
+use crossbeam_deque::Injector;
 use io_uring::IoUring;
 use once_cell::unsync::Lazy;
 use parking_lot::Mutex;
@@ -24,6 +27,7 @@ use slab::Slab;
 mod accept;
 pub mod address;
 pub mod buffers;
+mod executor;
 mod read_write;
 mod splice;
 mod uring_wrapper;
@@ -33,6 +37,8 @@ pub use address::SocketAddress;
 pub use buffers::{Buffer, BufferMut};
 pub use read_write::{IoFuture, StreamExt};
 pub use splice::{splice, SpliceFuture, SplicePrepared};
+
+use crate::executor::SpawnedExecutor;
 
 thread_local! {
     static SHARED: Lazy<RefCell<Option<Arc<Shared>>>> = Lazy::new(|| RefCell::new(None));
@@ -47,19 +53,16 @@ where
 
 /// An io_uring-driven asynchronous runtime.
 pub struct Runtime {
-    // ring: IoUring,
     shared: Arc<Shared>,
+    _executor_handles: Vec<JoinHandle<()>>,
 }
 
 struct Shared {
     pending_events: Mutex<Slab<PendingEvent>>,
-    ready_events: Mutex<HashMap<usize, EventResult>>,
+    ready_events: Mutex<HashMap<usize, std::io::Result<usize>>>,
     wait_for_slot: Mutex<VecDeque<std::task::Waker>>,
     ring: uring_wrapper::Uring,
-}
-
-enum EventResult {
-    IoEvent(std::io::Result<usize>),
+    tasks_injector: Arc<Injector<Task>>,
 }
 
 struct PendingEvent {
@@ -77,13 +80,48 @@ impl Runtime {
     /// Creates a new io_uring runtime, using the provided [IoUring] as a
     /// backend.
     pub fn new(ring: IoUring) -> Self {
+        let injector = Arc::new(Injector::new());
+        let shared = Arc::new(Shared {
+            pending_events: Mutex::default(),
+            ready_events: Mutex::default(),
+            ring: uring_wrapper::Uring::new(ring),
+            wait_for_slot: Mutex::default(),
+            tasks_injector: injector.clone(),
+        });
+
+        const WORKERS: usize = 5;
+        let termination = Arc::new(AtomicBool::new(false));
+
+        let mut join_handles = Vec::with_capacity(WORKERS);
+        let mut stealers = Vec::with_capacity(WORKERS);
+        let mut stealers_providers = Vec::with_capacity(WORKERS);
+
+        for _ in 0..WORKERS {
+            let SpawnedExecutor {
+                join_handle,
+                stealer,
+                stealers_provider,
+            } = crate::executor::spawn_executor(
+                shared.clone(),
+                injector.clone(),
+                termination.clone(),
+            );
+            join_handles.push(join_handle);
+            stealers.push(stealer);
+            stealers_providers.push(stealers_provider);
+        }
+
+        for stealers_provider in stealers_providers {
+            stealers
+                .iter()
+                .cloned()
+                .try_for_each(|stealer| stealers_provider.send(stealer))
+                .expect("Some thread already panicked? O_o");
+        }
+
         Self {
-            shared: Arc::new(Shared {
-                pending_events: Mutex::default(),
-                ready_events: Mutex::default(),
-                ring: uring_wrapper::Uring::new(ring),
-                wait_for_slot: Mutex::default(),
-            }),
+            shared,
+            _executor_handles: join_handles,
         }
     }
 
@@ -93,7 +131,9 @@ impl Runtime {
     where
         F: Future,
     {
-        let original_waker = Arc::new(UringWaker(AtomicBool::new(true)));
+        let original_waker = Arc::new(UringWaker {
+            awakened: AtomicBool::new(true),
+        });
         let waker = original_waker.clone().into();
         let mut context = Context::from_waker(&waker);
 
@@ -105,8 +145,10 @@ impl Runtime {
         // it can't be accessed directly anymore.
         let mut future = unsafe { Pin::new_unchecked(&mut future) };
         let ready = loop {
+            // If the "main" future has been awakened, disarm the flag and poll
+            // it!
             if original_waker
-                .0
+                .awakened
                 .swap(false, std::sync::atomic::Ordering::Relaxed)
             {
                 match future.as_mut().poll(&mut context) {
@@ -115,29 +157,46 @@ impl Runtime {
                 };
             }
 
-            let awaken = original_waker.0.load(std::sync::atomic::Ordering::Relaxed);
+            // If the freshly polled "main" future woken up itself, we shouldn't
+            // block in the "enter" syscall (submit-and-wait). So we "want" zero
+            // events when the `awakened` flag is true and at least one event
+            // when the flag is `false`. Since `false` -> `0` and `true` -> `1`,
+            // we need to inverse the flag before converting it to `usize`.
+            let want_events = usize::from(
+                !original_waker
+                    .awakened
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            );
 
             let ring = &self.shared.ring;
-
-            ring.submit_and_wait(if awaken { 0 } else { 1 })
-                .expect("Unexpected uring I/O error");
+            if want_events == 0 && ring.submission_is_empty() {
+                // No need to fall into a syscall if we don't wait for any
+                // events and the submission queue is empty.
+            } else {
+                ring.submit_and_wait(want_events)
+                    .expect("Unexpected uring I/O error");
+            }
 
             if !ring.submission_is_full() {
-                // Let's wake the futures, since the submission queue has some space.
+                // Let's wake the futures which are waiting for a slot in the
+                // submission queue.
                 while let Some(waker) = self.shared.wait_for_slot.lock().pop_front() {
                     waker.wake()
                 }
             }
 
+            // Drain the completion queue.
             for completed in ring.completed_entries() {
-                let result = completed.result();
-                let result =
-                    usize::try_from(result).map_err(|_| std::io::Error::from_raw_os_error(-result));
+                let result = completion_entry_result(&completed);
                 let token = completed.user_data() as usize;
-                self.shared
-                    .ready_events
-                    .lock()
-                    .insert(token, EventResult::IoEvent(result));
+                let previous = self.shared.ready_events.lock().insert(token, result);
+                if previous.is_some() {
+                    // This actually means a bug in the runtime implementation.
+                    log::error!(
+                        "Result of an event with the token {} has been overwritten!!",
+                        token
+                    );
+                }
                 if let Some(waker) = self.shared.pending_events.lock()[token].waker.take() {
                     waker.wake()
                 }
@@ -161,15 +220,13 @@ impl Shared {
         cx: &mut Context<'_>,
         token: usize,
     ) -> Option<(AssociatedData, std::io::Result<usize>)> {
-        if let Some(event) = self.ready_events.lock().remove(&token) {
+        if let Some(result) = self.ready_events.lock().remove(&token) {
             let PendingEvent { data, .. } = self
                 .pending_events
                 .lock()
                 .try_remove(token)
                 .expect("Where did it go?");
-            match event {
-                EventResult::IoEvent(result) => Some((data, result)),
-            }
+            Some((data, result))
         } else {
             // Not ready yet.
             self.pending_events.lock()[token].waker = Some(cx.waker().clone());
@@ -210,9 +267,7 @@ impl Shared {
             Err(error) => Err((error, address)),
         })
     }
-}
 
-impl Shared {
     /// Tries to add an event to the submission queue.
     ///
     /// # Safety
@@ -236,37 +291,60 @@ impl Shared {
             false
         }
     }
+
+    fn spawn(&self, task: Task) {
+        // TODO: need to unpark executors!
+        self.tasks_injector.push(task)
+    }
 }
 
-struct UringWaker(AtomicBool);
+struct UringWaker {
+    awakened: AtomicBool,
+}
 
 impl Wake for UringWaker {
     fn wake(self: Arc<Self>) {
-        self.0.store(true, std::sync::atomic::Ordering::Relaxed)
+        self.awakened
+            .store(true, std::sync::atomic::Ordering::Relaxed)
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
-        self.0.store(true, std::sync::atomic::Ordering::Relaxed)
+        self.awakened
+            .store(true, std::sync::atomic::Ordering::Relaxed)
     }
 }
 
-impl Drop for Runtime {
+impl Drop for Shared {
     fn drop(&mut self) {
-        if self.shared.pending_events.lock().is_empty() {
+        if self.pending_events.lock().is_empty() {
             return;
         }
-        // Ensure that there are no pending requests in the queues which
-        // reference the buffers we are going to drop when `self.events` is
-        // dropped.
-        let ring = &self.shared.ring;
+        // Ensure that there are no pending requests in the submission queue
+        // which reference the buffers we are going to drop when `self.events`
+        // is dropped.
+        let ring = &self.ring;
         let pending_events = ring.submission_len();
 
-        if let Err(_e) = ring.submit_and_wait(pending_events) {
-            // TODO: log the error
+        if let Err(e) = ring.submit_and_wait(pending_events) {
+            log::error!("Submit-and-wait terminated with an error: {:#}", e);
             return;
         };
-        // Safety: since we've got here, it means the main loop has been
-        // terminated and we are the only possible user of the completion queue.
         ring.completed_entries().for_each(drop);
     }
+}
+
+fn completion_entry_result(entry: &io_uring::cqueue::Entry) -> std::io::Result<usize> {
+    let raw_result = entry.result();
+    // uring encodes error codes as negative value of the result, so if we try
+    // to convert the result to an unsigned integer and the conversion fails, it
+    // means en error has been encountered.
+    usize::try_from(raw_result).map_err(|_| std::io::Error::from_raw_os_error(-raw_result))
+}
+
+/// A "task" to execute.
+pub type Task = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// Spawns a task onto an executor.
+pub fn spawn(task: Task) {
+    with_shared(|shared| shared.spawn(task))
 }

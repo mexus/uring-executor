@@ -1,7 +1,9 @@
-use std::net::{Ipv6Addr, TcpListener, TcpStream};
+use std::{
+    borrow::Cow,
+    net::{Ipv6Addr, TcpListener, TcpStream},
+};
 
 use anyhow::Context;
-use io_uring::IoUring;
 use uring_executor::{ListenerExt as _, Runtime, SocketAddress, StreamExt as _};
 
 fn main() -> anyhow::Result<()> {
@@ -10,7 +12,11 @@ fn main() -> anyhow::Result<()> {
     }
     env_logger::init();
 
-    let ring = IoUring::new(100).context("IoUring::new")?;
+    let ring = io_uring::Builder::default()
+        .setup_sqpoll(1000)
+        .build(100)
+        .context("Building IoUring")?;
+    // let ring = io_uring::IoUring::new(100).context("IoUring::new")?;
     let mut runtime = Runtime::new(ring);
 
     let listener =
@@ -19,7 +25,11 @@ fn main() -> anyhow::Result<()> {
     let listening_address = listener.local_addr().context("TcpListened::local_addr")?;
     log::info!("Listening at {}", listening_address);
 
-    if let Err(e) = runtime.block_on(run(&listener, vec![0u8; 1024], SocketAddress::new())) {
+    if let Err(e) = runtime.block_on(run(
+        &listener,
+        vec![0u8; 10 * 1024 * 1024],
+        SocketAddress::new(),
+    )) {
         log::error!("Accepting loop terminated with error: {:#}", e)
     }
 
@@ -33,6 +43,10 @@ async fn run(
     mut buffer: Vec<u8>,
     mut address_buffer: SocketAddress<uring_executor::address::Uninitialized>,
 ) -> anyhow::Result<Never> {
+    uring_executor::spawn(Box::pin(async {
+        println!("Yay, a free future!");
+    }));
+
     loop {
         log::info!("Waiting for connection");
         let (stream, peer_address) = match listener.async_accept(address_buffer).into_future().await
@@ -71,7 +85,11 @@ async fn copy_all(stream: TcpStream, mut tmp_buffer: Vec<u8>) -> (anyhow::Result
         log::debug!(
             "Received {} bytes: {:?}",
             bytes_read,
-            String::from_utf8_lossy(&tmp_buffer[..bytes_read])
+            if log::log_enabled!(log::Level::Trace) {
+                String::from_utf8_lossy(&tmp_buffer[..bytes_read])
+            } else {
+                Cow::from("<skip>")
+            }
         );
         let (result, buffer) = stream
             .async_write(tmp_buffer, ..bytes_read)

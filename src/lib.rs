@@ -11,7 +11,10 @@ use std::{
     net::TcpStream,
     os::unix::prelude::FromRawFd,
     pin::Pin,
-    sync::{atomic::AtomicBool, Arc},
+    sync::{
+        atomic::{AtomicBool, AtomicU64},
+        Arc,
+    },
     task::{Context, Poll, Wake},
     thread::JoinHandle,
 };
@@ -20,14 +23,16 @@ use address::{Initialized, Uninitialized};
 use buffers::BufferRawParts;
 use crossbeam_deque::Injector;
 use io_uring::IoUring;
-use once_cell::unsync::Lazy;
+use once_cell::{sync::OnceCell, unsync::Lazy};
 use parking_lot::Mutex;
+use parking_tools::ParkingManager;
 use slab::Slab;
 
 mod accept;
 pub mod address;
 pub mod buffers;
 mod executor;
+mod parking_tools;
 mod read_write;
 mod splice;
 mod uring_wrapper;
@@ -54,7 +59,6 @@ where
 /// An io_uring-driven asynchronous runtime.
 pub struct Runtime {
     shared: Arc<Shared>,
-    _executor_handles: Vec<JoinHandle<()>>,
 }
 
 struct Shared {
@@ -63,6 +67,7 @@ struct Shared {
     wait_for_slot: Mutex<VecDeque<std::task::Waker>>,
     ring: uring_wrapper::Uring,
     tasks_injector: Arc<Injector<Task>>,
+    executor_handles: OnceCell<ParkingManager>,
 }
 
 struct PendingEvent {
@@ -80,28 +85,31 @@ impl Runtime {
     /// Creates a new io_uring runtime, using the provided [IoUring] as a
     /// backend.
     pub fn new(ring: IoUring) -> Self {
+        const WORKERS: usize = 5;
+
         let injector = Arc::new(Injector::new());
         let shared = Arc::new(Shared {
             pending_events: Mutex::default(),
             ready_events: Mutex::default(),
-            ring: uring_wrapper::Uring::new(ring),
             wait_for_slot: Mutex::default(),
+            ring: uring_wrapper::Uring::new(ring),
             tasks_injector: injector.clone(),
+            executor_handles: OnceCell::new(),
         });
 
-        const WORKERS: usize = 5;
         let termination = Arc::new(AtomicBool::new(false));
 
         let mut join_handles = Vec::with_capacity(WORKERS);
         let mut stealers = Vec::with_capacity(WORKERS);
         let mut stealers_providers = Vec::with_capacity(WORKERS);
 
-        for _ in 0..WORKERS {
+        for executor_id in 0..WORKERS {
             let SpawnedExecutor {
                 join_handle,
                 stealer,
                 stealers_provider,
             } = crate::executor::spawn_executor(
+                executor_id,
                 shared.clone(),
                 injector.clone(),
                 termination.clone(),
@@ -110,6 +118,10 @@ impl Runtime {
             stealers.push(stealer);
             stealers_providers.push(stealers_provider);
         }
+        shared
+            .executor_handles
+            .set(ParkingManager::new(join_handles))
+            .expect("This is the only time when the handles are set");
 
         for stealers_provider in stealers_providers {
             stealers
@@ -119,10 +131,7 @@ impl Runtime {
                 .expect("Some thread already panicked? O_o");
         }
 
-        Self {
-            shared,
-            _executor_handles: join_handles,
-        }
+        Self { shared }
     }
 
     /// Sets up the execution context and runs the provided future to the
@@ -293,8 +302,30 @@ impl Shared {
     }
 
     fn spawn(&self, task: Task) {
-        // TODO: need to unpark executors!
-        self.tasks_injector.push(task)
+        self.tasks_injector.push(task);
+
+        // After pushing a task to the tasks injector, wake up a parker executor (if any).
+        if let Some((batch_id, executor_id)) = self
+            .executors_park_bitmap
+            .iter()
+            .enumerate()
+            .map(|(batch_id, bitmap)| (batch_id, bitmap.load(std::sync::atomic::Ordering::SeqCst)))
+            .find_map(|(batch_id, bitmap)| {
+                if bitmap == 0 {
+                    // No "true" bits => no executor in the batch is parked.
+                    return None;
+                }
+                let position_of_true = bitmap.trailing_zeros();
+                Some((batch_id, position_of_true))
+            })
+        {
+            // Found a parked executor.
+            let executor_id = batch_id * 64 + (executor_id as usize);
+            log::debug!("Unpark executor {}", executor_id);
+            self.executor_handles.get().expect("Must be set up")[executor_id]
+                .thread()
+                .unpark();
+        }
     }
 }
 

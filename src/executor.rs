@@ -38,6 +38,7 @@ pub struct SpawnedExecutor {
 }
 
 pub(crate) fn spawn_executor(
+    executor_id: usize,
     uring: Arc<Shared>,
     global: Arc<Injector<Task>>,
     termination: Arc<AtomicBool>,
@@ -57,7 +58,15 @@ pub(crate) fn spawn_executor(
         let stealers = remote_stealers.into_iter().collect::<Vec<_>>();
 
         // Finally ready to start!
-        execute(uring, &worker, &global, &stealers, waker, &termination);
+        execute(
+            executor_id,
+            uring,
+            &worker,
+            &global,
+            &stealers,
+            waker,
+            &termination,
+        );
     });
     let stealer = receiver.recv().expect("Shouldn't fail");
     SpawnedExecutor {
@@ -69,6 +78,7 @@ pub(crate) fn spawn_executor(
 
 /// Executes tasks from the shared pool.
 fn execute(
+    executor_id: usize,
     uring: Arc<Shared>,
     local: &Worker<Task>,
     global: &Injector<Task>,
@@ -76,8 +86,20 @@ fn execute(
     waker: Arc<ThreadWaker>,
     termination: &AtomicBool,
 ) {
+    let batch_id = executor_id / 64;
+    let batch_executor_id = executor_id % 64;
+    let parking_mask = 1u64 << batch_executor_id;
+    let unpark_mask = u64::MAX - (1u64 << batch_executor_id);
+
+    log::debug!(
+        "Executor #{} park mask {:064b}, unpark mask: {:064b}",
+        executor_id,
+        parking_mask,
+        unpark_mask
+    );
+
     crate::SHARED.with(|shared| {
-        *shared.borrow_mut() = Some(uring);
+        *shared.borrow_mut() = Some(uring.clone());
     });
     let waker = Waker::from(waker);
     let mut context = Context::from_waker(&waker);
@@ -97,9 +119,9 @@ fn execute(
                 }
             }
         } else {
-            // No tasks to execute, waiting for somebody to unpark the thread.
-            // std::thread::park();
-            std::thread::sleep(std::time::Duration::from_secs(1))
+            uring.executors_park_bitmap[batch_id].fetch_or(parking_mask, Ordering::SeqCst);
+            std::thread::park();
+            uring.executors_park_bitmap[batch_id].fetch_and(unpark_mask, Ordering::SeqCst);
         }
     }
 

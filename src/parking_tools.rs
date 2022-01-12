@@ -35,6 +35,8 @@ impl ParkingManager {
             .find(|thread| thread.parked.load(std::sync::atomic::Ordering::SeqCst))
         {
             thread.handle.thread().unpark()
+        } else {
+            log::trace!("No threads to unpark (out of {})", self.threads.len());
         }
     }
 }
@@ -56,6 +58,11 @@ impl<'a> ParkingHelper<'a> {
 
     /// Marks the thread as parked and returns a guard that remove the mark when dropped.
     pub fn guard<'helper>(&'helper self) -> ParkingGuard<'a, 'helper> {
+        // Safety: the index is checked when the type is constructed.
+        let thread = unsafe { self.manager.threads.get_unchecked(self.index) };
+        thread
+            .parked
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         ParkingGuard { helper: self }
     }
 

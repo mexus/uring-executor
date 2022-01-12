@@ -13,7 +13,7 @@ use std::{
 
 use crossbeam_deque::{Injector, Stealer, Worker};
 
-use crate::{Shared, Task};
+use crate::{parking_tools::ParkingHelper, Shared, Task};
 
 /// A wrapper handle to a thread.
 pub(crate) struct ThreadWaker(std::thread::Thread);
@@ -86,18 +86,8 @@ fn execute(
     waker: Arc<ThreadWaker>,
     termination: &AtomicBool,
 ) {
-    let batch_id = executor_id / 64;
-    let batch_executor_id = executor_id % 64;
-    let parking_mask = 1u64 << batch_executor_id;
-    let unpark_mask = u64::MAX - (1u64 << batch_executor_id);
-
-    log::debug!(
-        "Executor #{} park mask {:064b}, unpark mask: {:064b}",
-        executor_id,
-        parking_mask,
-        unpark_mask
-    );
-
+    let manager = uring.executor_handles.get().unwrap();
+    let parking_helper = ParkingHelper::new(manager, executor_id);
     crate::SHARED.with(|shared| {
         *shared.borrow_mut() = Some(uring.clone());
     });
@@ -119,9 +109,10 @@ fn execute(
                 }
             }
         } else {
-            uring.executors_park_bitmap[batch_id].fetch_or(parking_mask, Ordering::SeqCst);
+            let _guard = parking_helper.guard();
+            log::trace!("Executor #{} parked", executor_id);
             std::thread::park();
-            uring.executors_park_bitmap[batch_id].fetch_and(unpark_mask, Ordering::SeqCst);
+            log::trace!("Executor #{} unparked", executor_id);
         }
     }
 

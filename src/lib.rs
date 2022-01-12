@@ -11,12 +11,8 @@ use std::{
     net::TcpStream,
     os::unix::prelude::FromRawFd,
     pin::Pin,
-    sync::{
-        atomic::{AtomicBool, AtomicU64},
-        Arc,
-    },
+    sync::{atomic::AtomicBool, Arc},
     task::{Context, Poll, Wake},
-    thread::JoinHandle,
 };
 
 use address::{Initialized, Uninitialized};
@@ -304,28 +300,9 @@ impl Shared {
     fn spawn(&self, task: Task) {
         self.tasks_injector.push(task);
 
-        // After pushing a task to the tasks injector, wake up a parker executor (if any).
-        if let Some((batch_id, executor_id)) = self
-            .executors_park_bitmap
-            .iter()
-            .enumerate()
-            .map(|(batch_id, bitmap)| (batch_id, bitmap.load(std::sync::atomic::Ordering::SeqCst)))
-            .find_map(|(batch_id, bitmap)| {
-                if bitmap == 0 {
-                    // No "true" bits => no executor in the batch is parked.
-                    return None;
-                }
-                let position_of_true = bitmap.trailing_zeros();
-                Some((batch_id, position_of_true))
-            })
-        {
-            // Found a parked executor.
-            let executor_id = batch_id * 64 + (executor_id as usize);
-            log::debug!("Unpark executor {}", executor_id);
-            self.executor_handles.get().expect("Must be set up")[executor_id]
-                .thread()
-                .unpark();
-        }
+        // After pushing a task to the tasks injector, wake up a parked executor
+        // (if any).
+        self.executor_handles.get().unwrap().unpark_any();
     }
 }
 

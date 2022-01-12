@@ -43,12 +43,11 @@ async fn run(
     mut buffer: Vec<u8>,
     mut address_buffer: SocketAddress<uring_executor::address::Uninitialized>,
 ) -> anyhow::Result<Never> {
-    uring_executor::spawn(Box::pin(async {
-        println!("Yay, a free future!");
-    }));
-
     loop {
         log::info!("Waiting for connection");
+        uring_executor::spawn(Box::pin(async {
+            log::info!("Yay, a free future!");
+        }));
         let (stream, peer_address) = match listener.async_accept(address_buffer).into_future().await
         {
             Ok((stream, address)) => {
